@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uk-cpi"
+version = "0.1.0"
+description = "UK CPI and interest rate data tools"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "pandas>=2.0",
+]
+
+[project.scripts]
+sonia-futures = "uk_cpi.sonia_futures:main"
