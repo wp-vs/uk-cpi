@@ -5,8 +5,10 @@ Fallback: Playwright scraping of ICE product page.
 """
 
 import argparse
+import calendar
 import re
 import sys
+from datetime import date
 from io import StringIO
 
 import pandas as pd
@@ -70,7 +72,7 @@ def fetch_via_ib(
         df = pd.DataFrame(rows)
         if not df.empty:
             df = df.sort_values("contract").reset_index(drop=True)
-        return df
+        return _enrich_with_dates(df)
     finally:
         ib.disconnect()
 
@@ -110,7 +112,7 @@ def fetch_via_playwright(headless: bool = True) -> pd.DataFrame:
         html = page.content()
         browser.close()
 
-    return _parse_html_table(html)
+    return _enrich_with_dates(_parse_html_table(html))
 
 
 def fetch_sonia_futures(
@@ -169,7 +171,7 @@ def _parse_json_data(data: list | dict) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values("contract").reset_index(drop=True)
-    return df
+    return _enrich_with_dates(df)
 
 
 def _parse_html_table(html: str) -> pd.DataFrame:
@@ -194,6 +196,72 @@ def _parse_html_table(html: str) -> pd.DataFrame:
         re.sub(r"\s+", "_", str(c).strip().lower()) for c in largest.columns
     ]
     return largest
+
+
+# Month code mapping for contract labels like "Jun26", "Mar27"
+_MONTH_CODES = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+# IMM quarterly cycle: Mar -> Jun -> Sep -> Dec -> Mar ...
+_PREV_IMM_MONTH = {3: 12, 6: 3, 9: 6, 12: 9}
+
+
+def _third_wednesday(year: int, month: int) -> date:
+    """Return the 3rd Wednesday of a given month (IMM date)."""
+    # calendar.monthcalendar returns weeks Mon=0..Sun=6
+    cal = calendar.monthcalendar(year, month)
+    # Wednesday is index 2; find the 3rd occurrence
+    wednesdays = [week[2] for week in cal if week[2] != 0]
+    return date(year, month, wednesdays[2])
+
+
+def _contract_period(label: str) -> tuple[date, date] | None:
+    """Derive the reference period (start, end) from a contract label.
+
+    SONIA 3-month futures reference the compounded SONIA rate between
+    two consecutive IMM dates (3rd Wednesdays of quarterly months).
+    E.g. "Jun26" covers 3rd-Wed-Mar-2026 to 3rd-Wed-Jun-2026.
+    """
+    m = re.match(r"^([A-Za-z]{3})(\d{2})$", label.strip())
+    if not m:
+        return None
+    month_str, year_str = m.group(1).lower(), m.group(2)
+    month = _MONTH_CODES.get(month_str)
+    if month is None or month not in _PREV_IMM_MONTH:
+        return None
+    year = 2000 + int(year_str)
+
+    end_date = _third_wednesday(year, month)
+    prev_month = _PREV_IMM_MONTH[month]
+    prev_year = year - 1 if prev_month == 12 else year
+    start_date = _third_wednesday(prev_year, prev_month)
+    return start_date, end_date
+
+
+def _enrich_with_dates(df: pd.DataFrame) -> pd.DataFrame:
+    """Add contract_start and contract_end columns and filter junk rows."""
+    if df.empty:
+        return df
+
+    # Identify the contract column
+    contract_col = None
+    for col in df.columns:
+        if "contract" in col.lower() or "local_symbol" in col.lower():
+            contract_col = col
+            break
+    if contract_col is None:
+        return df
+
+    # Filter out pack/bundle rows and rows with chart garbage
+    mask = df[contract_col].astype(str).str.match(r"^[A-Za-z]{3}\d{2}$")
+    df = df[mask].copy()
+
+    periods = df[contract_col].apply(_contract_period)
+    df["contract_start"] = periods.apply(lambda p: p[0] if p else None)
+    df["contract_end"] = periods.apply(lambda p: p[1] if p else None)
+    return df.reset_index(drop=True)
 
 
 def _parse_num(value) -> float | None:
